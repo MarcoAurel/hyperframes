@@ -47,4 +47,4 @@ token="$(jq -r '.outputToken' <<<"$response")"
 curl -sS --fail -o "$out" "${URL}/outputs/${token}"
 
 echo "OK  ${out}  ($(jq -r '.fileSize' <<<"$response") bytes, $(jq -r '.durationMs' <<<"$response") ms)"
-echo "Server-side copy: ${RENDERS_DIR}/${job}.mp4 (not auto-deleted, see README)"
+echo "Server-side copy: ${RENDERS_DIR}/${job}.mp4 (auto-deleted after PRODUCER_RENDERS_RETENTION_MINUTES, see README)"

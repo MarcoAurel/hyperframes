@@ -63,6 +63,8 @@ PRODUCER_LOW_MEMORY_MODE=true
 | `PRODUCER_MAX_CONCURRENT_RENDERS` | Renders simultáneos. Con `1`, el resto espera en cola.                                                                                                               |
 | `PRODUCER_LOW_MEMORY_MODE`        | Perfil de bajo consumo (1 worker). Con 8 GB o menos se activa solo; aquí se fuerza.                                                                                  |
 
+La limpieza automática de `/renders` tiene sus propias variables (ver sección 8).
+
 ## 3. Recursos (pestaña **Resources**)
 
 | Campo              | Valor recomendado |
@@ -198,22 +200,43 @@ Validar antes de gastar CPU: `POST /lint`.
    Por defecto el archivo se llama como la carpeta del proyecto y un segundo render lo sobrescribe.
    Usa una extensión acorde al `format` pedido (`.mp4`, `.webm`, `.mov`).
 3. **Descargar el MP4 enseguida.** El enlace dura 15 minutos y vive solo en memoria:
-   si el contenedor se reinicia, se pierde.
+   si el contenedor se reinicia, se pierde. Además, el archivo en `/renders` se borra solo
+   pasados 60 minutos (ver sección 8).
 4. **Esperar con paciencia.** `POST /render` se queda abierto hasta terminar, y con otros
    renders en curso la petición espera su turno. Usa `/render/stream` si quieres ver
    `queued` y el progreso.
 
-## 8. Mantenimiento
+## 8. Limpieza automática de `/renders`
 
-**Los MP4 de `/renders` no se borran solos.** El servidor solo borra las carpetas temporales
-de proyectos inline. Si no se limpia, el disco se llena.
+El servidor de render **nunca borra** los videos terminados; solo elimina las carpetas
+temporales de proyectos inline. Por eso la imagen incluye una limpieza automática
+(`scripts/easypanel-entrypoint.sh`): un barrido en segundo plano que borra los videos viejos de
+`/renders` y después arranca el servidor.
 
-- Recomendado: que el agente borre el archivo de `/renders` tras descargarlo (comparten el Bind).
-- Alternativa manual, desde la **Shell** del servicio:
+| Variable                                    | Por defecto | Qué hace                                                    |
+| ------------------------------------------- | ----------- | ----------------------------------------------------------- |
+| `PRODUCER_RENDERS_RETENTION_MINUTES`        | `60`        | Borra los videos con más de estos minutos. `0` = no borrar. |
+| `PRODUCER_RENDERS_CLEANUP_INTERVAL_SECONDS` | `600`       | Cada cuántos segundos se hace el barrido.                   |
 
-  ```bash
-  find /renders -name '*.mp4' -mmin +60 -delete
-  ```
+Cómo se comporta:
+
+- Solo borra **archivos regulares** `*.mp4`, `*.webm` y `*.mov`, también dentro de subcarpetas.
+  Nunca borra carpetas ni otros tipos de archivo.
+- La retención mínima es de **15 minutos**: un valor menor se sube a 15, porque el enlace de
+  descarga vive 15 minutos y no se debe borrar un archivo que aún se puede pedir.
+- Se niega a limpiar `/` y se desactiva si la carpeta no existe o los valores no son enteros positivos.
+- Cada archivo borrado queda registrado en los **Logs** (`[renders-cleanup] removed …`).
+
+> **Trata `/renders` como temporal.** Como es un Bind compartido, cualquier video de esa carpeta
+> con más de 60 minutos se borrará, aunque no lo haya generado el render. Si necesitas conservar
+> resultados, que el agente los mueva a otra carpeta después de descargarlos.
+
+Si prefieres no borrar nada automáticamente, pon `PRODUCER_RENDERS_RETENTION_MINUTES=0` y limpia
+a mano desde la **Shell** del servicio:
+
+```bash
+find /renders -name '*.mp4' -mmin +60 -delete
+```
 
 ## Solución de problemas
 
