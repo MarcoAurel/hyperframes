@@ -1,0 +1,26 @@
+# Applied only to `Dockerfile.easypanel` (BuildKit picks up
+# <Dockerfile>.dockerignore). A root .dockerignore is deliberately avoided: it
+# would also affect Dockerfile.test, which needs packages/producer/tests.
+
+.git
+.github
+.claude
+.agents
+.codex
+.codex-plugin
+.claude-plugin
+.cursor-plugin
+**/node_modules
+**/.debug
+**/*.log
+
+# Not needed to build the producer image
+docs
+examples
+plans
+releases
+skills
+registry
+updates
+themes
+assets

@@ -1,0 +1,161 @@
+# HyperFrames Producer — render API image for EasyPanel (GitHub → Dockerfile build).
+#
+# Runs the producer HTTP server (packages/producer/dist/public-server.js):
+#   POST /render, POST /render/stream, GET /render/queue, POST /lint,
+#   GET /outputs/:token, GET /health
+#
+# The API has NO authentication. Deploy it WITHOUT a public domain and call it
+# from other services of the same EasyPanel project over the internal network
+# (http://<service-name>:9847).
+#
+# Build context is the REPOSITORY ROOT:
+#   docker build -f Dockerfile.easypanel -t hyperframes-render .
+#
+# ── Resource policy ──────────────────────────────────────────────────────────
+# Goal: render slowly rather than compete with other processes on the host.
+#
+#   * The engine sizes Chrome workers from os.cpus(), which IGNORES the
+#     container CPU quota — so workers are capped explicitly below.
+#   * Memory limits ARE read from the cgroup (<= 8 GB selects the low-memory
+#     profile automatically); it is also forced on here.
+#   * Renders run one at a time; extra requests wait in a FIFO queue.
+#   * The process runs at a lower CPU priority (nice 10) than other workloads.
+#
+# Recommended EasyPanel limits: 2 CPU / 4 GB RAM. Every value below can be
+# overridden from the EasyPanel "Environment" tab without rebuilding.
+#
+# ── Mounts (configure in EasyPanel → Mounts) ─────────────────────────────────
+#   /projects  volume — composition folders + their assets (images, video, audio,
+#              fonts). Call the API with {"projectDir": "/projects/<name>"}.
+#   /renders   volume — rendered output files.
+
+FROM node:22-bookworm-slim AS base
+
+# ── System dependencies (same set as the other production images) ────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    unzip \
+    ffmpeg \
+    tini \
+    libgbm1 \
+    libnss3 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxrandr2 \
+    libcups2 \
+    libasound2 \
+    libpangocairo-1.0-0 \
+    libxshmfence1 \
+    libgtk-3-0 \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    fonts-noto-cjk \
+    fonts-noto-core \
+    fonts-noto-extra \
+    fonts-noto-ui-core \
+    fonts-freefont-ttf \
+    fonts-dejavu-core \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean \
+    && fc-cache -fv
+
+# ── chrome-headless-shell (deterministic BeginFrame capture) ─────────────────
+# Same pinned version as packages/gcp-cloud-run/Dockerfile. Bump deliberately:
+# each Chrome release shifts pixel output.
+RUN npx --yes @puppeteer/browsers install chrome-headless-shell@148.0.7778.167 \
+      --path /opt/puppeteer \
+    && CHS="$(find /opt/puppeteer/chrome-headless-shell -name chrome-headless-shell -type f | head -n1)" \
+    && mkdir -p /opt/chrome \
+    && ln -s "$CHS" /opt/chrome/chrome-headless-shell \
+    && /opt/chrome/chrome-headless-shell --version \
+    && rm -rf /root/.npm
+
+ENV HYPERFRAMES_CHROME_PATH=/opt/chrome/chrome-headless-shell \
+    PRODUCER_HEADLESS_SHELL_PATH=/opt/chrome/chrome-headless-shell \
+    PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    CONTAINER=true
+
+WORKDIR /app
+
+# bun drives install + build (the repo's package manager). Runtime is plain Node.
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.13"
+ENV PATH="/root/.bun/bin:$PATH"
+
+# ── Dependencies (manifests first for layer caching) ─────────────────────────
+# Every workspace member must be present, or `--frozen-lockfile` treats the
+# missing one as a lockfile change and fails.
+COPY package.json bun.lock ./
+COPY packages/parsers/package.json packages/parsers/package.json
+COPY packages/lint/package.json packages/lint/package.json
+COPY packages/studio-server/package.json packages/studio-server/package.json
+COPY packages/core/package.json packages/core/package.json
+COPY packages/engine/package.json packages/engine/package.json
+COPY packages/player/package.json packages/player/package.json
+COPY packages/producer/package.json packages/producer/package.json
+COPY packages/cli/package.json packages/cli/package.json
+COPY packages/studio/package.json packages/studio/package.json
+COPY packages/shader-transitions/package.json packages/shader-transitions/package.json
+COPY packages/aws-lambda/package.json packages/aws-lambda/package.json
+COPY packages/gcp-cloud-run/package.json packages/gcp-cloud-run/package.json
+COPY packages/sdk/package.json packages/sdk/package.json
+COPY packages/sdk-playground/package.json packages/sdk-playground/package.json
+COPY scripts/package-subpaths.mjs scripts/package-subpaths.mjs
+# A corrupt tarball extraction can hang instead of exiting; bound each attempt
+# and retry once so a deploy build fails fast.
+RUN timeout 300 bun install --frozen-lockfile \
+    || timeout 300 bun install --frozen-lockfile
+
+# ── Build only what the producer needs ───────────────────────────────────────
+COPY packages/parsers/ packages/parsers/
+COPY packages/lint/ packages/lint/
+COPY packages/studio-server/ packages/studio-server/
+COPY packages/core/ packages/core/
+RUN bun run --cwd packages/parsers build \
+    && bun run --cwd packages/lint build \
+    && bun run --cwd packages/studio-server build \
+    && bun run --cwd packages/core build \
+    && bun run --cwd packages/core build:hyperframes-runtime:modular
+
+COPY packages/engine/ packages/engine/
+COPY packages/producer/ packages/producer/
+RUN bun run --cwd packages/engine build \
+    && (cd packages/producer && bunx tsx scripts/generate-font-data.ts) \
+    && bun run --cwd packages/producer build \
+    # healthWorker.ts looks for healthWorkerThread.js NEXT TO the running file.
+    # Bundled into dist/public-server.js that is dist/, but esbuild emits the
+    # worker in dist/services/ — without this copy the worker never starts
+    # ("could not resolve worker entry") and the :9848 HEALTHCHECK fails.
+    && cp packages/producer/dist/services/healthWorkerThread.js \
+          packages/producer/dist/healthWorkerThread.js
+
+# ── Runtime configuration ────────────────────────────────────────────────────
+RUN mkdir -p /projects /renders /tmp/hf-projects
+
+ENV NODE_ENV=production \
+    PRODUCER_PORT=9847 \
+    PRODUCER_HEALTH_PORT=9848 \
+    PRODUCER_RENDERS_DIR=/renders \
+    PRODUCER_TMP_PROJECT_DIR=/tmp/hf-projects \
+    # Resource limits — see header. Override from EasyPanel if needed.
+    PRODUCER_MAX_WORKERS=2 \
+    PRODUCER_MAX_CONCURRENT_RENDERS=1 \
+    PRODUCER_LOW_MEMORY_MODE=true \
+    NODE_OPTIONS=--max-old-space-size=1536
+
+EXPOSE 9847 9848
+
+# /health on the worker-thread port stays responsive while a render saturates
+# the main event loop, so EasyPanel does not restart the container mid-render.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PRODUCER_HEALTH_PORT||9848)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+WORKDIR /app/packages/producer
+
+# tini: clean PID 1 / SIGTERM handling. nice: lower CPU priority so renders
+# yield to other workloads on the host (inherited by Chrome and FFmpeg).
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["nice", "-n", "10", "node", "dist/public-server.js"]
